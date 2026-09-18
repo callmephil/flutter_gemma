@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:ffi';
 
 import 'package:flutter_gemma_litertlm/src/ffi/litert_lm_bindings.dart';
@@ -20,8 +21,11 @@ void main() {
       client.registerLiveForTest(conv);
       expect(client.isConversationLiveForTest(conv), isTrue);
 
-      // Model/handle teardown deletes it.
-      client.deleteConversationForTest(conv);
+      // Model/handle teardown deletes it. The native free now runs on a
+      // spawned isolate, so this returns before it finishes — but liveness
+      // drops HERE, synchronously, which is the whole point: the window the
+      // free opens is exactly when a late cancel must find the conv dead.
+      unawaited(client.deleteConversationForTest(conv));
 
       expect(
         client.isConversationLiveForTest(conv),
