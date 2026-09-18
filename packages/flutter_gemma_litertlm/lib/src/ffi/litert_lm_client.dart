@@ -206,10 +206,16 @@ class LiteRtLmConversationHandle implements ConversationHandle {
     // milliseconds. `_cancelOn` is lock-free so it can interrupt a generation
     // that holds `_nativeMutex`. The virtual-session path already does this in
     // `releaseVirtualConversation`; this brings the single-session path in line.
-    _client._cancelOn(_conversation!);
-    _client._deleteConversation(_conversation!);
+    // The free itself goes to a spawned isolate: even a cancelled drain costs
+    // 65-80ms, and this runs on the way into every new chat. `close()` stays
+    // synchronous — that is ConversationHandle's contract — so the client
+    // keeps the future, [LiteRtLmFfiClient.shutdown] waits on it, and the next
+    // create queues behind it on the mutex.
+    final conv = _conversation!;
+    _client._cancelOn(conv);
     _conversation = null;
     _client._handles.remove(this);
+    _client._deleteConversationDeferred(conv);
   }
 }
 
@@ -219,11 +225,12 @@ class LiteRtLmConversationHandle implements ConversationHandle {
 /// `this` or any other non-const closure state.
 ///
 /// Deliberately a plain open, and safe only because of an ordering invariant:
-/// both callers run inside `initialize()`, which calls `_ensureBindings()` —
-/// and therefore `openLiteRtLmRequiringDefaultScope` — first. On Android a
-/// plain open cannot DEMOTE an already-global soinfo, so arriving second is
-/// harmless. If a future caller can reach this before `_ensureBindings`, it
-/// must go through litert_default_scope.dart instead or it reintroduces #447.
+/// every caller runs after `initialize()` has awaited [_warmNativeLibraries],
+/// which calls [_openNativeLibraries] — and therefore, on Android,
+/// `openLiteRtLmRequiringDefaultScope` — first. On Android a plain open cannot
+/// DEMOTE an already-global soinfo, so arriving second is harmless. If a future
+/// caller can reach this before the warm, it must go through
+/// litert_default_scope.dart instead or it reintroduces #447.
 DynamicLibrary _openLiteRtLmLibrary() {
   if (Platform.isIOS) {
     return DynamicLibrary.open(
@@ -244,6 +251,202 @@ DynamicLibrary _openLiteRtLmLibrary() {
   }
   return DynamicLibrary.open('LiteRtLm.dll');
 }
+
+/// Opens every native library the FFI client needs, in the order each
+/// platform requires, and returns the two handles the bindings are built
+/// from.
+///
+/// Top-level and free of instance state so the FIRST load in the process can
+/// happen on a spawned isolate ([_warmNativeLibraries]). The loader is
+/// process-wide: once this has run anywhere, the main isolate's own call
+/// finds every library already mapped and relocated and pays a refcount bump
+/// instead of ~100ms of blocked UI thread.
+///
+/// The Android branch stays the STRICT default-scope open, so the warm isolate
+/// being first is exactly the order #447 needs (see litert_default_scope.dart).
+({DynamicLibrary lib, DynamicLibrary proxyLib}) _openNativeLibraries() {
+  final DynamicLibrary lib;
+  final DynamicLibrary proxyLib;
+  if (Platform.isIOS) {
+    // On iOS, Native Assets bundles dylibs in Frameworks/ inside Runner.app.
+    // The host app's Xcode project must also copy raw lib*.dylib files
+    // alongside the .framework bundles (see "Setup LiteRT-LM iOS" build
+    // phase in example/ios/Runner.xcodeproj/project.pbxproj) — needed
+    // because gpu_registry.cc uses relative-basename dlopen which iOS
+    // dyld 4 cannot resolve from .framework names alone.
+    lib = DynamicLibrary.open(
+      '@executable_path/Frameworks/LiteRtLm.framework/LiteRtLm',
+    );
+    proxyLib = DynamicLibrary.open(
+      '@executable_path/Frameworks/StreamProxy.framework/StreamProxy',
+    );
+  } else if (Platform.isMacOS) {
+    lib = DynamicLibrary.open('LiteRtLm.framework/LiteRtLm');
+    proxyLib = DynamicLibrary.open('StreamProxy.framework/StreamProxy');
+  } else if (Platform.isLinux) {
+    // Load order matters: libLiteRt.so must be loaded first with
+    // RTLD_GLOBAL so libLiteRtLm.so (built with
+    // litert_runtime_link_mode=dynamic) and the WebGPU accelerator can
+    // resolve LiteRt* C API symbols
+    // against it. StreamProxy exposes a dlopen helper because Dart's
+    // DynamicLibrary.open uses RTLD_LOCAL which hides symbols.
+    //
+    // Native Assets places .so files in <bundle>/lib/. Dart's
+    // DynamicLibrary.open finds them by basename via Flutter-set RPATH,
+    // but a raw C dlopen via stream_proxy_load_global doesn't see that
+    // path — pass an absolute path so it resolves regardless of
+    // LD_LIBRARY_PATH / RPATH inheritance.
+    final libDir = '${File(Platform.resolvedExecutable).parent.path}/lib';
+    proxyLib = DynamicLibrary.open('libStreamProxy.so');
+    final loadGlobal = proxyLib
+        .lookupFunction<
+          Pointer Function(Pointer<Utf8>),
+          Pointer Function(Pointer<Utf8>)
+        >('stream_proxy_load_global');
+    // Preload sequence:
+    // - libLiteRt.so first (provides LiteRt C API used by the WebGPU
+    //   accelerator at registration)
+    // - libGemmaModelConstraintProvider.so (libLiteRtLm.so has a
+    //   SONAME-level dependency on it)
+    // - libLiteRtWebGpuAccelerator.so so gpu_registry.cc:162 can find it
+    //   via the loader's already-loaded modules table when it does
+    //   basename-only dlopen
+    // - libLiteRtLm.so itself
+    //
+    // libLiteRtTopKWebGpuSampler.so is intentionally NOT preloaded:
+    // its Create() holds a process-static wgpu::Instance and rejects
+    // any second engine_create with `wgpu::Instance already set`,
+    // making model swap and multi-session tests impossible. With the
+    // sampler not preloaded, sampler_factory.cc:443's dlopen returns
+    // Unavailable and the factory falls back to the static / CPU
+    // sampler chain — inference itself still runs on the GPU
+    // accelerator, only the per-token argmax happens on CPU
+    // (negligible perf hit, ~1-5ms/token).
+    for (final name in const [
+      'libLiteRt.so',
+      'libGemmaModelConstraintProvider.so',
+      'libLiteRtWebGpuAccelerator.so',
+      'libLiteRtLm.so',
+    ]) {
+      final fullPath = '$libDir/$name';
+      final pathPtr = fullPath.toNativeUtf8();
+      final handle = loadGlobal(pathPtr);
+      calloc.free(pathPtr);
+      if (handle == nullptr) {
+        throw Exception('Failed to load $fullPath with RTLD_GLOBAL');
+      }
+    }
+    lib = DynamicLibrary.open('libLiteRtLm.so');
+  } else if (Platform.isWindows) {
+    // Preload LiteRt.dll first so the WebGPU accelerator and TopK sampler
+    // can resolve LiteRt* C API + their own exports through the process
+    // module list before sampler_factory does its LoadLibrary lookup
+    // (mirrors the Linux/Android RTLD_GLOBAL pattern).
+    proxyLib = DynamicLibrary.open('StreamProxy.dll');
+    final loadGlobal = proxyLib
+        .lookupFunction<
+          Pointer Function(Pointer<Utf8>),
+          Pointer Function(Pointer<Utf8>)
+        >('stream_proxy_load_global');
+    for (final name in const [
+      'LiteRt.dll',
+      'libLiteRtTopKWebGpuSampler.dll',
+      'libLiteRtWebGpuAccelerator.dll',
+      'LiteRtLm.dll',
+    ]) {
+      final pathPtr = name.toNativeUtf8();
+      final handle = loadGlobal(pathPtr);
+      calloc.free(pathPtr);
+      if (handle == nullptr) {
+        throw Exception('Failed to preload $name (LoadLibraryEx)');
+      }
+    }
+    lib = DynamicLibrary.open('LiteRtLm.dll');
+  } else if (Platform.isAndroid) {
+    // LiteRT-LM ships native libs only for android_arm64 — bail with a
+    // typed message before dlopen surfaces a generic ENOENT on x86_64
+    // emulators / armeabi-v7a devices (#250). MediaPipe `.task` text
+    // inference still works on those ABIs through the Kotlin path; only
+    // `.litertlm` (FFI) requires arm64.
+    if (Abi.current() != Abi.androidArm64) {
+      throw UnsupportedError(
+        'flutter_gemma .litertlm models require an arm64-v8a Android device '
+        '(got ${Abi.current()}). Use a `.task` MediaPipe model on this ABI '
+        'or run on an arm64-v8a device / Apple Silicon emulator.',
+      );
+    }
+    proxyLib = DynamicLibrary.open('libStreamProxy.so');
+    // Load LiteRtLm into the default search scope so stream_proxy's ABI
+    // probe can resolve the v0.15 chunk accessors through
+    // dlsym(RTLD_DEFAULT); Dart's DynamicLibrary.open uses RTLD_LOCAL, which
+    // hides them. That probe is the ONLY verified consumer of ambient
+    // visibility here: measured on the shipped android_arm64 bundle, the GPU
+    // and OpenCL accelerators have zero undefined LiteRt* symbols, and the
+    // TopK samplers resolve theirs through DT_NEEDED, not RTLD_DEFAULT.
+    //
+    // Shared with the embeddings/speech entry point (litert_bindings.dart)
+    // because the two race for "first to open", and the loser used to decide
+    // the outcome silently. The helper also verifies the load rather than
+    // trusting a non-NULL handle — see its header and #447.
+    lib = openLiteRtLmRequiringDefaultScope('libLiteRtLm.so');
+  } else {
+    throw UnsupportedError(
+      'Platform not supported for FFI: ${Platform.operatingSystem}',
+    );
+  }
+
+  return (lib: lib, proxyLib: proxyLib);
+}
+
+/// Whether the LiteRT-LM native libraries have been loaded in this process.
+///
+/// Read and written only on the main isolate. It is process-wide state, not
+/// per-client: the dynamic loader is, and a second [LiteRtLmFfiClient] does not
+/// make the libraries load twice.
+bool _nativeLibrariesLoaded = false;
+
+/// Test seam. A unit test has no native library to open, so nothing may be
+/// dispatched to an isolate that would try; a test that wants to watch a
+/// teardown dispatch happen sets this true and stubs [offMainIsolate].
+@visibleForTesting
+bool get nativeLibrariesLoadedForTest => _nativeLibrariesLoaded;
+
+@visibleForTesting
+set nativeLibrariesLoadedForTest(bool value) => _nativeLibrariesLoaded = value;
+
+/// How a native call that must not block the UI thread reaches a spawned
+/// isolate. Always `Isolate.run` in production; replaced by tests, which have
+/// no native library behind the call.
+@visibleForTesting
+Future<void> Function(void Function() work) offMainIsolate = Isolate.run;
+
+/// Pays the process's first `dlopen` of the LiteRT-LM libraries on a spawned
+/// isolate.
+///
+/// `_ensureBindings` used to do that first load inline, and on an S25 Ultra it
+/// cost ~100ms of blocked UI thread before `initialize`'s engine-create isolate
+/// was even spawned — mapping and relocating libLiteRtLm plus the default-scope
+/// probe. Native libraries are loaded per PROCESS, not per isolate, so doing it
+/// anywhere first makes the main isolate's own open a refcount bump.
+///
+/// Costs one extra isolate spawn, off the UI thread. Leaves the flag false when
+/// the load throws, so the failure is reported and a later attempt retries —
+/// the same way a failed `_ensureBindings` leaves `_bindings` null.
+Future<void> _warmNativeLibraries() async {
+  if (_nativeLibrariesLoaded) return;
+  final isolateLogLevel = gemmaLogLevel;
+  final sw = Stopwatch()..start();
+  await offMainIsolate(() {
+    gemmaLogLevel = isolateLogLevel;
+    _openNativeLibraries();
+  });
+  _nativeLibrariesLoaded = true;
+  gemmaLog(
+    '[LiteRtLmFfi/perf] native libraries warmed off the main isolate: '
+    '${sw.elapsedMilliseconds}ms',
+  );
+}
+
 
 /// Calls native `litert_lm_conversation_create` on a spawned isolate.
 ///
@@ -272,6 +475,29 @@ Future<int> _createConversationOffMainIsolate({
       Pointer.fromAddress(engineAddr),
       Pointer.fromAddress(configAddr),
     ).address;
+  });
+}
+
+/// Calls native `litert_lm_conversation_delete` on a spawned isolate.
+///
+/// The native call is synchronous and slow even after a cancel: it runs
+/// `~SessionBasic` → `ThreadPool::WaitUntilDone`, measured at 65-80ms on an
+/// S25 Ultra. On the main isolate that is 65-80ms of blocked UI thread at
+/// EVERY `createChat`, because opening a chat closes the previous conversation
+/// first (the engine holds one at a time, upstream #966) — so the cost lands
+/// once per step of a multi-step flow, not once per app run.
+///
+/// Native pointers are process-wide, so a conversation created on one isolate
+/// can be freed from another. Mirrors [_createConversationOffMainIsolate].
+Future<void> _deleteConversationOffMainIsolate(int convAddr) {
+  final isolateLogLevel = gemmaLogLevel;
+  return offMainIsolate(() {
+    gemmaLogLevel = isolateLogLevel;
+    final delete = _openLiteRtLmLibrary()
+        .lookupFunction<Void Function(Pointer), void Function(Pointer)>(
+          'litert_lm_conversation_delete',
+        );
+    delete(Pointer.fromAddress(convAddr));
   });
 }
 
@@ -342,7 +568,8 @@ class LiteRtLmFfiClient {
   final Set<LiteRtLmConversationHandle> _handles = {};
 
   /// Every conversation pointer currently alive (minted by
-  /// [_createRawConversation], removed by [_deleteConversation]). [_cancelOn]
+  /// [_createRawConversation], removed by [_deleteConversationOffMain]).
+  /// [_cancelOn]
   /// consults this before dereferencing a pointer: a raw-stream or virtual-turn
   /// onCancel can fire after model/handle/engine teardown already freed the
   /// conversation, and cancelling a dangling pointer is a use-after-free SIGSEGV
@@ -370,10 +597,23 @@ class LiteRtLmFfiClient {
   void registerLiveForTest(Pointer<LiteRtLmConversation> conv) =>
       _liveConvs.add(conv);
 
-  /// Test seam: drive the real [_deleteConversation] without a native binding.
+  /// Test seam: drive the real teardown path — the same one
+  /// [LiteRtLmConversationHandle.close] takes — without a native binding.
   @visibleForTesting
-  void deleteConversationForTest(Pointer<LiteRtLmConversation> conv) =>
-      _deleteConversation(conv);
+  Future<void> deleteConversationForTest(Pointer<LiteRtLmConversation> conv) =>
+      _deleteConversationLocked(conv);
+
+  /// Test seam (read-only): how many conversation frees are dispatched to an
+  /// isolate and not finished. [shutdown] drains this before `engine_delete`.
+  @visibleForTesting
+  int get pendingDeleteCountForTest => _pendingDeletes.length;
+
+  /// Test seam: drive the synchronous-by-contract teardown entry point, the
+  /// one whose future only [shutdown] can wait for.
+  @visibleForTesting
+  void deleteConversationDeferredForTest(
+    Pointer<LiteRtLmConversation> conv,
+  ) => _deleteConversationDeferred(conv);
 
   /// Backing handle for the legacy single-conversation API
   /// ([createConversation] / [closeConversation] / [chat] / etc.). Kept so
@@ -472,140 +712,20 @@ class LiteRtLmFfiClient {
   String? get nativeLogPath => _nativeLogPath;
 
   /// Load the native library and create bindings.
+  ///
+  /// Synchronous, and meant to run AFTER [_warmNativeLibraries] has paid the
+  /// process's first load on a spawned isolate — what is left here is then a
+  /// refcount bump plus pure-Dart symbol lookups. Reached without the warm (a
+  /// direct caller, or a warm that threw) it still works; it just does the
+  /// whole load on the calling isolate, which is the ~100ms of blocked UI
+  /// thread this pair exists to move.
   void _ensureBindings() {
     if (_bindings != null) return;
 
     final loadSw = Stopwatch()..start();
     gemmaLog('[LiteRtLmFfi] Loading native libraries...');
-    final DynamicLibrary lib;
-    final DynamicLibrary proxyLib;
-    if (Platform.isIOS) {
-      // On iOS, Native Assets bundles dylibs in Frameworks/ inside Runner.app.
-      // The host app's Xcode project must also copy raw lib*.dylib files
-      // alongside the .framework bundles (see "Setup LiteRT-LM iOS" build
-      // phase in example/ios/Runner.xcodeproj/project.pbxproj) — needed
-      // because gpu_registry.cc uses relative-basename dlopen which iOS
-      // dyld 4 cannot resolve from .framework names alone.
-      lib = DynamicLibrary.open(
-        '@executable_path/Frameworks/LiteRtLm.framework/LiteRtLm',
-      );
-      proxyLib = DynamicLibrary.open(
-        '@executable_path/Frameworks/StreamProxy.framework/StreamProxy',
-      );
-    } else if (Platform.isMacOS) {
-      lib = DynamicLibrary.open('LiteRtLm.framework/LiteRtLm');
-      proxyLib = DynamicLibrary.open('StreamProxy.framework/StreamProxy');
-    } else if (Platform.isLinux) {
-      // Load order matters: libLiteRt.so must be loaded first with
-      // RTLD_GLOBAL so libLiteRtLm.so (built with
-      // litert_runtime_link_mode=dynamic) and the WebGPU accelerator can
-      // resolve LiteRt* C API symbols
-      // against it. StreamProxy exposes a dlopen helper because Dart's
-      // DynamicLibrary.open uses RTLD_LOCAL which hides symbols.
-      //
-      // Native Assets places .so files in <bundle>/lib/. Dart's
-      // DynamicLibrary.open finds them by basename via Flutter-set RPATH,
-      // but a raw C dlopen via stream_proxy_load_global doesn't see that
-      // path — pass an absolute path so it resolves regardless of
-      // LD_LIBRARY_PATH / RPATH inheritance.
-      final libDir = '${File(Platform.resolvedExecutable).parent.path}/lib';
-      proxyLib = DynamicLibrary.open('libStreamProxy.so');
-      final loadGlobal = proxyLib
-          .lookupFunction<
-            Pointer Function(Pointer<Utf8>),
-            Pointer Function(Pointer<Utf8>)
-          >('stream_proxy_load_global');
-      // Preload sequence:
-      // - libLiteRt.so first (provides LiteRt C API used by the WebGPU
-      //   accelerator at registration)
-      // - libGemmaModelConstraintProvider.so (libLiteRtLm.so has a
-      //   SONAME-level dependency on it)
-      // - libLiteRtWebGpuAccelerator.so so gpu_registry.cc:162 can find it
-      //   via the loader's already-loaded modules table when it does
-      //   basename-only dlopen
-      // - libLiteRtLm.so itself
-      //
-      // libLiteRtTopKWebGpuSampler.so is intentionally NOT preloaded:
-      // its Create() holds a process-static wgpu::Instance and rejects
-      // any second engine_create with `wgpu::Instance already set`,
-      // making model swap and multi-session tests impossible. With the
-      // sampler not preloaded, sampler_factory.cc:443's dlopen returns
-      // Unavailable and the factory falls back to the static / CPU
-      // sampler chain — inference itself still runs on the GPU
-      // accelerator, only the per-token argmax happens on CPU
-      // (negligible perf hit, ~1-5ms/token).
-      for (final name in const [
-        'libLiteRt.so',
-        'libGemmaModelConstraintProvider.so',
-        'libLiteRtWebGpuAccelerator.so',
-        'libLiteRtLm.so',
-      ]) {
-        final fullPath = '$libDir/$name';
-        final pathPtr = fullPath.toNativeUtf8();
-        final handle = loadGlobal(pathPtr);
-        calloc.free(pathPtr);
-        if (handle == nullptr) {
-          throw Exception('Failed to load $fullPath with RTLD_GLOBAL');
-        }
-      }
-      lib = DynamicLibrary.open('libLiteRtLm.so');
-    } else if (Platform.isWindows) {
-      // Preload LiteRt.dll first so the WebGPU accelerator and TopK sampler
-      // can resolve LiteRt* C API + their own exports through the process
-      // module list before sampler_factory does its LoadLibrary lookup
-      // (mirrors the Linux/Android RTLD_GLOBAL pattern).
-      proxyLib = DynamicLibrary.open('StreamProxy.dll');
-      final loadGlobal = proxyLib
-          .lookupFunction<
-            Pointer Function(Pointer<Utf8>),
-            Pointer Function(Pointer<Utf8>)
-          >('stream_proxy_load_global');
-      for (final name in const [
-        'LiteRt.dll',
-        'libLiteRtTopKWebGpuSampler.dll',
-        'libLiteRtWebGpuAccelerator.dll',
-        'LiteRtLm.dll',
-      ]) {
-        final pathPtr = name.toNativeUtf8();
-        final handle = loadGlobal(pathPtr);
-        calloc.free(pathPtr);
-        if (handle == nullptr) {
-          throw Exception('Failed to preload $name (LoadLibraryEx)');
-        }
-      }
-      lib = DynamicLibrary.open('LiteRtLm.dll');
-    } else if (Platform.isAndroid) {
-      // LiteRT-LM ships native libs only for android_arm64 — bail with a
-      // typed message before dlopen surfaces a generic ENOENT on x86_64
-      // emulators / armeabi-v7a devices (#250). MediaPipe `.task` text
-      // inference still works on those ABIs through the Kotlin path; only
-      // `.litertlm` (FFI) requires arm64.
-      if (Abi.current() != Abi.androidArm64) {
-        throw UnsupportedError(
-          'flutter_gemma .litertlm models require an arm64-v8a Android device '
-          '(got ${Abi.current()}). Use a `.task` MediaPipe model on this ABI '
-          'or run on an arm64-v8a device / Apple Silicon emulator.',
-        );
-      }
-      proxyLib = DynamicLibrary.open('libStreamProxy.so');
-      // Load LiteRtLm into the default search scope so stream_proxy's ABI
-      // probe can resolve the v0.15 chunk accessors through
-      // dlsym(RTLD_DEFAULT); Dart's DynamicLibrary.open uses RTLD_LOCAL, which
-      // hides them. That probe is the ONLY verified consumer of ambient
-      // visibility here: measured on the shipped android_arm64 bundle, the GPU
-      // and OpenCL accelerators have zero undefined LiteRt* symbols, and the
-      // TopK samplers resolve theirs through DT_NEEDED, not RTLD_DEFAULT.
-      //
-      // Shared with the embeddings/speech entry point (litert_bindings.dart)
-      // because the two race for "first to open", and the loser used to decide
-      // the outcome silently. The helper also verifies the load rather than
-      // trusting a non-NULL handle — see its header and #447.
-      lib = openLiteRtLmRequiringDefaultScope('libLiteRtLm.so');
-    } else {
-      throw UnsupportedError(
-        'Platform not supported for FFI: ${Platform.operatingSystem}',
-      );
-    }
+    final (:lib, :proxyLib) = _openNativeLibraries();
+    _nativeLibrariesLoaded = true;
 
     _bindings = LiteRtLmBindings(lib);
     _proxyLib = proxyLib;
@@ -671,6 +791,11 @@ class LiteRtLmFfiClient {
     bool? enableSpeculativeDecoding,
   }) async {
     final initSw = Stopwatch()..start();
+    // Load the libraries on a spawned isolate FIRST, so the call below finds
+    // them already mapped. Doing that load inline cost ~100ms of blocked UI
+    // thread on an S25 Ultra, before the engine-create isolate was even
+    // spawned — the first half of the stall in front of a model's first answer.
+    await _warmNativeLibraries();
     _ensureBindings();
     _backend = backend;
     final bindingsMs = initSw.elapsedMilliseconds;
@@ -1120,7 +1245,9 @@ class LiteRtLmFfiClient {
       // shutdown may now be queued behind us — in which case this conversation
       // must not escape. The engine is still alive here, so deleting is safe.
       if (_isShuttingDown || _engine == null) {
-        if (conv != nullptr) _deleteConversation(conv);
+        // Lock-free variant: every caller of this method already holds
+        // [_nativeMutex], and the mutex is not reentrant.
+        if (conv != nullptr) await _deleteConversationOffMain(conv);
         throw StateError('Client shut down while creating a conversation');
       }
     } finally {
@@ -1384,9 +1511,13 @@ class LiteRtLmFfiClient {
         if (_virtualActiveToken == pending) {
           final conv = _virtualConv;
           if (conv != null) {
-            _deleteConversation(conv);
+            // Awaited, and lock-free: this branch runs with [_nativeMutex]
+            // still held (it is released below), and the mutex is not
+            // reentrant. Waiting here keeps the release honest — the lock is
+            // only handed on once the conversation is actually gone.
             _virtualConv = null;
             _virtualActiveToken = null;
+            await _deleteConversationOffMain(conv);
           }
         }
       }
@@ -1406,8 +1537,10 @@ class LiteRtLmFfiClient {
           // and rebuild one replaying this session's history as a preface.
           final old = _virtualConv;
           if (old != null) {
-            _deleteConversation(old);
+            // Awaited before the create below, so the engine still sees one
+            // conversation at a time (#966). Lock-free: we hold the mutex.
             _virtualConv = null;
+            await _deleteConversationOffMain(old);
           }
           final historyJson = history.isEmpty
               ? null
@@ -1528,9 +1661,12 @@ class LiteRtLmFfiClient {
     }
     final conv = _virtualConv;
     if (conv != null) {
-      _deleteConversation(conv);
       _virtualConv = null;
       _virtualActiveToken = null;
+      // No turn is in flight, so nothing holds the mutex on our behalf and
+      // nothing can await us: the locked, tracked variant. [shutdown] waits
+      // for it before deleting the engine.
+      _deleteConversationDeferred(conv);
     }
   }
 
@@ -1746,17 +1882,63 @@ class LiteRtLmFfiClient {
     _legacyHandle?.cancelGeneration();
   }
 
-  /// Delete a conversation pointer. Called by
-  /// [LiteRtLmConversationHandle.close].
-  void _deleteConversation(Pointer<LiteRtLmConversation> conv) {
+  /// Free a conversation pointer on a spawned isolate.
+  ///
+  /// Lock-free, like [_createRawConversation] — callers that need
+  /// serialization hold [_nativeMutex] around it, and the ones that cannot
+  /// hold it themselves go through [_deleteConversationLocked].
+  ///
+  /// Gated on the libraries being loaded rather than on `_bindings`: the
+  /// isolate opens the library by name itself, so what matters is that there
+  /// IS one in this process. A client that never initialized has no
+  /// conversation to free either way.
+  Future<void> _deleteConversationOffMain(
+    Pointer<LiteRtLmConversation> conv,
+  ) async {
     // Drop liveness first so any onCancel that races this teardown no-ops in
     // [_cancelOn] rather than dereferencing the pointer we are about to free.
     _liveConvs.remove(conv);
-    if (_bindings != null) {
-      _bindings!.litert_lm_conversation_delete(conv);
-      gemmaLog('[LiteRtLmFfi] Conversation closed');
-    }
+    if (!_nativeLibrariesLoaded) return;
+    await _deleteConversationOffMainIsolate(conv.address);
+    gemmaLog('[LiteRtLmFfi] Conversation closed');
   }
+
+  /// [_deleteConversationOffMain] serialized against generation and against
+  /// any create on this engine, for callers that do not already hold
+  /// [_nativeMutex].
+  ///
+  /// The mutex is FIFO, which is what keeps the delete-before-create order the
+  /// engine needs (#966) now that the delete no longer blocks its caller: a
+  /// create requested after this returns queues behind the pending free.
+  Future<void> _deleteConversationLocked(Pointer<LiteRtLmConversation> conv) {
+    // Synchronously, before queueing: between here and the free the pointer is
+    // doomed, so a late cancel must already find it dead.
+    _liveConvs.remove(conv);
+    return _nativeMutex.protect(() => _deleteConversationOffMain(conv));
+  }
+
+  /// Start [_deleteConversationLocked] and keep the future, for the two
+  /// teardown entry points that are synchronous by contract
+  /// ([LiteRtLmConversationHandle.close] and [releaseVirtualConversation]).
+  ///
+  /// Nobody can await these, so [shutdown] does it for them — `engine_delete`
+  /// bulk-frees every conversation, and running it while an isolate is inside
+  /// `conversation_delete` would free the same object twice. Failures are
+  /// logged here for the same reason: there is no caller to receive them.
+  void _deleteConversationDeferred(Pointer<LiteRtLmConversation> conv) {
+    late final Future<void> done;
+    done = _deleteConversationLocked(conv)
+        .catchError(
+          (Object e) =>
+              gemmaLog('[LiteRtLmFfi] conversation delete failed: $e'),
+        )
+        .whenComplete(() => _pendingDeletes.remove(done));
+    _pendingDeletes.add(done);
+  }
+
+  /// Conversation frees dispatched to an isolate and not finished yet.
+  /// Awaited by [shutdown] before `engine_delete`.
+  final Set<Future<void>> _pendingDeletes = {};
 
   /// Legacy: close the implicit [_legacyHandle] conversation.
   void closeConversation() {
@@ -1767,10 +1949,12 @@ class LiteRtLmFfiClient {
   /// Shutdown the engine and release all resources. Closes every live
   /// conversation handle first (legacy + any opened directly).
   ///
-  /// Waits for any conversation create suspended inside [_guardCreate]. Since
-  /// `litert_lm_conversation_create` runs on a spawned isolate, deleting the
-  /// engine while one is in flight frees the engine out from under native code
-  /// that is still dereferencing it.
+  /// Waits for any conversation create suspended inside [_guardCreate], and
+  /// for any conversation free still running on an isolate. Both
+  /// `litert_lm_conversation_create` and `litert_lm_conversation_delete` run
+  /// on spawned isolates, so deleting the engine while one is in flight frees
+  /// the engine (and its conversations) out from under native code that is
+  /// still dereferencing them.
   ///
   /// Consequently this never completes if the native create itself hangs. That
   /// is deliberate — the alternative is tearing down the engine underneath it —
@@ -1798,9 +1982,17 @@ class LiteRtLmFfiClient {
     final vc = _virtualConv;
     if (vc != null) {
       _cancelOn(vc);
-      _deleteConversation(vc);
       _virtualConv = null;
       _virtualActiveToken = null;
+      await _deleteConversationLocked(vc);
+    }
+
+    // Conversation frees now run on spawned isolates, so the handle closes
+    // above returned before their native calls did. `engine_delete` bulk-frees
+    // every conversation the engine still owns — running it while an isolate
+    // is inside `conversation_delete` would free the same object twice.
+    if (_pendingDeletes.isNotEmpty) {
+      await Future.wait(_pendingDeletes.toList());
     }
 
     if (_engine != null && _engine != nullptr && _bindings != null) {

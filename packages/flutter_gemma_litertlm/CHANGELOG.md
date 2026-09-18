@@ -1,3 +1,6 @@
+## Unreleased
+- Native library load and conversation teardown move off the main isolate (UI stall).
+
 ## 1.6.4
 - `maxTokens` is no longer clamped up to 1024 on `PreferredBackend.npu`.
 
