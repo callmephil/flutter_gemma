@@ -260,7 +260,7 @@ DynamicLibrary _openLiteRtLmLibrary() {
 /// happen on a spawned isolate ([_warmNativeLibraries]). The loader is
 /// process-wide: once this has run anywhere, the main isolate's own call
 /// finds every library already mapped and relocated and pays a refcount bump
-/// instead of ~100ms of blocked UI thread.
+/// instead of the load itself.
 ///
 /// The Android branch stays the STRICT default-scope open, so the warm isolate
 /// being first is exactly the order #447 needs (see litert_default_scope.dart).
@@ -423,11 +423,14 @@ Future<void> Function(void Function() work) offMainIsolate = Isolate.run;
 /// Pays the process's first `dlopen` of the LiteRT-LM libraries on a spawned
 /// isolate.
 ///
-/// `_ensureBindings` used to do that first load inline, and on an S25 Ultra it
-/// cost ~100ms of blocked UI thread before `initialize`'s engine-create isolate
-/// was even spawned — mapping and relocating libLiteRtLm plus the default-scope
-/// probe. Native libraries are loaded per PROCESS, not per isolate, so doing it
-/// anywhere first makes the main isolate's own open a refcount bump.
+/// `_ensureBindings` used to do that first load inline — mapping and relocating
+/// libLiteRtLm plus the default-scope probe — on the UI thread, before
+/// `initialize`'s engine-create isolate was even spawned. It was blamed for a
+/// ~100ms block on an S25 Ultra; on its own isolate the load takes 13ms there,
+/// and most of that block turned out to be the engine settings create, which
+/// [_createEngine] now does off the main isolate too. Native libraries are
+/// loaded per PROCESS, not per isolate, so doing it anywhere first makes the
+/// main isolate's own open a refcount bump.
 ///
 /// Costs one extra isolate spawn, off the UI thread. Leaves the flag false when
 /// the load throws, so the failure is reported and a later attempt retries —
@@ -499,6 +502,195 @@ Future<void> _deleteConversationOffMainIsolate(int convAddr) {
         );
     delete(Pointer.fromAddress(convAddr));
   });
+}
+
+/// Everything `litert_lm_engine_create` is configured from, decided on the
+/// calling isolate and carried to the one that builds the engine.
+///
+/// Plain values only, so it crosses to a spawned isolate by copy. The native
+/// settings object is made from it on that isolate, used there and freed
+/// there ([_createEngine]), so no `LiteRtLmEngineSettings*` is ever handed
+/// between isolates or touched by the main one.
+@visibleForTesting
+@immutable
+class EngineCreateRequest {
+  const EngineCreateRequest({
+    required this.modelPath,
+    required this.backend,
+    required this.maxTokens,
+    required this.logLevel,
+    this.visionBackend,
+    this.audioBackend,
+    this.cacheDir,
+    this.maxNumImages = 0,
+    this.enableSpeculativeDecoding,
+    this.dispatchLibDir,
+    this.disableHwMaskingForNpu = false,
+    this.kernelBatchSize,
+  });
+
+  final String modelPath;
+
+  /// Text backend wire name: 'cpu', 'gpu' or 'npu'.
+  final String backend;
+
+  final int maxTokens;
+
+  /// The caller's log level. A spawned isolate gets a fresh copy of the
+  /// per-isolate `gemmaLogLevel` (default info), so it is sent along.
+  final GemmaLogLevel logLevel;
+
+  /// Vision encoder backend; null when the engine is built without vision.
+  final String? visionBackend;
+
+  /// Audio encoder backend; null when the engine is built without audio.
+  final String? audioBackend;
+
+  final String? cacheDir;
+
+  /// Applied only when positive.
+  final int maxNumImages;
+
+  /// Null leaves the model's own default.
+  final bool? enableSpeculativeDecoding;
+
+  /// The directory LiteRT loads its NPU dispatch library from; null when the
+  /// backend is not an NPU.
+  final String? dispatchLibDir;
+
+  /// Windows NPU: turn off the HW mask update path.
+  final bool disableHwMaskingForNpu;
+
+  /// Android GPU: flush the command queue every N ops (#364); null leaves the
+  /// engine's default.
+  final int? kernelBatchSize;
+}
+
+/// How `initialize` reaches the isolate that builds the engine settings and
+/// the engine. Returns the engine's address, 0 when `litert_lm_engine_create`
+/// returned NULL. Always a spawned isolate in production; replaced by tests,
+/// which have no native library behind the call.
+@visibleForTesting
+Future<int> Function(EngineCreateRequest request) createEngineOffMainIsolate =
+    _createEngineOnSpawnedIsolate;
+
+Future<int> _createEngineOnSpawnedIsolate(EngineCreateRequest request) =>
+    Isolate.run(() => _createEngine(request));
+
+/// Builds the engine settings from [r], creates the engine from them and frees
+/// them, all on the isolate this runs on — a spawned one, through
+/// [createEngineOffMainIsolate].
+///
+/// `litert_lm_engine_settings_create` is not cheap: on an S25 Ultra it took
+/// 81ms, called on the main isolate just before the engine's isolate was
+/// spawned, and a frame started 98ms late around it. It was most of the ~100ms
+/// block first put down to the library load, which [_warmNativeLibraries] had
+/// already moved. Settings made here are used and freed on the same isolate,
+/// so no settings pointer has to be valid anywhere else.
+int _createEngine(EngineCreateRequest r) {
+  gemmaLogLevel = r.logLevel;
+  final sw = Stopwatch()..start();
+  final b = LiteRtLmBindings(_openLiteRtLmLibrary());
+  gemmaLog(
+    '[LiteRtLmFfi/perf]   isolate: DynamicLibrary.open: ${sw.elapsedMilliseconds}ms',
+    level: GemmaLogLevel.verbose,
+  );
+
+  final modelPathPtr = r.modelPath.toNativeUtf8();
+  final backendPtr = r.backend.toNativeUtf8();
+  final visionBackendPtr = r.visionBackend?.toNativeUtf8();
+  final audioBackendPtr = r.audioBackend?.toNativeUtf8();
+  try {
+    final settingsStart = sw.elapsedMilliseconds;
+    final settings = b.litert_lm_engine_settings_create(
+      modelPathPtr.cast(),
+      backendPtr.cast(),
+      visionBackendPtr?.cast<Char>() ?? nullptr,
+      audioBackendPtr?.cast<Char>() ?? nullptr,
+    );
+    gemmaLog(
+      '[LiteRtLmFfi/perf]   isolate: settings_create: ${sw.elapsedMilliseconds - settingsStart}ms',
+    );
+    if (settings == nullptr) {
+      throw Exception('Failed to create engine settings');
+    }
+
+    try {
+      _configureEngineSettings(b, settings, r);
+      final createStart = sw.elapsedMilliseconds;
+      final engine = b.litert_lm_engine_create(settings);
+      gemmaLog(
+        '[LiteRtLmFfi/perf]   isolate: native litert_lm_engine_create: ${sw.elapsedMilliseconds - createStart}ms',
+        level: GemmaLogLevel.verbose,
+      );
+      return engine.address;
+    } finally {
+      // The engine keeps what it needs; the settings are done with either way.
+      b.litert_lm_engine_settings_delete(settings);
+    }
+  } finally {
+    calloc.free(modelPathPtr);
+    calloc.free(backendPtr);
+    if (visionBackendPtr != null) calloc.free(visionBackendPtr);
+    if (audioBackendPtr != null) calloc.free(audioBackendPtr);
+  }
+}
+
+/// Applies [r] to [settings]. What each value is for, and why a platform gets
+/// it, is said where `initialize` decides it.
+void _configureEngineSettings(
+  LiteRtLmBindings b,
+  Pointer<LiteRtLmEngineSettings> settings,
+  EngineCreateRequest r,
+) {
+  b.litert_lm_engine_settings_set_max_num_tokens(settings, r.maxTokens);
+
+  // Enable benchmarking for session metrics (token counts, timing)
+  b.litert_lm_engine_settings_enable_benchmark(settings);
+
+  final cacheDir = r.cacheDir;
+  if (cacheDir != null) {
+    final cacheDirPtr = cacheDir.toNativeUtf8();
+    // Sets cache dir on main, vision, and audio executors (C API patched)
+    b.litert_lm_engine_settings_set_cache_dir(settings, cacheDirPtr.cast());
+    calloc.free(cacheDirPtr);
+  }
+
+  if (r.maxNumImages > 0) {
+    b.litert_lm_engine_settings_set_max_num_images(settings, r.maxNumImages);
+  }
+
+  // MTP / speculative decoding (LiteRT-LM v0.11.0+). Skip when null so
+  // the SDK uses the model's default; only call when caller explicitly
+  // forces on/off.
+  final enableSpeculativeDecoding = r.enableSpeculativeDecoding;
+  if (enableSpeculativeDecoding != null) {
+    b.litert_lm_engine_settings_set_enable_speculative_decoding(
+      settings,
+      enableSpeculativeDecoding,
+    );
+  }
+
+  final dispatchLibDir = r.dispatchLibDir;
+  if (dispatchLibDir != null) {
+    final dirPtr = dispatchLibDir.toNativeUtf8();
+    b.litert_lm_engine_settings_set_litert_dispatch_lib_dir(
+      settings,
+      dirPtr.cast(),
+    );
+    calloc.free(dirPtr);
+  }
+  if (r.disableHwMaskingForNpu) {
+    b.litert_lm_engine_settings_set_use_hw_masking_for_npu(settings, false);
+  }
+
+  final kernelBatchSize = r.kernelBatchSize;
+  if (kernelBatchSize != null) {
+    b.litert_lm_engine_settings_set_kernel_batch_size(
+      settings,
+      kernelBatchSize,
+    );
+  }
 }
 
 /// High-level Dart wrapper around the LiteRT-LM C API.
@@ -615,6 +807,13 @@ class LiteRtLmFfiClient {
     Pointer<LiteRtLmConversation> conv,
   ) => _deleteConversationDeferred(conv);
 
+  /// Test seam: stand in for the bindings [_ensureBindings] would load, so
+  /// [initialize] runs on a host with no native library. Every native call the
+  /// calling isolate makes then resolves through [bindings]' lookup, where a
+  /// test can see it.
+  @visibleForTesting
+  set bindingsForTest(LiteRtLmBindings bindings) => _bindings = bindings;
+
   /// Backing handle for the legacy single-conversation API
   /// ([createConversation] / [closeConversation] / [chat] / etc.). Kept so
   /// existing single-session call sites work unchanged while the new
@@ -717,8 +916,8 @@ class LiteRtLmFfiClient {
   /// process's first load on a spawned isolate — what is left here is then a
   /// refcount bump plus pure-Dart symbol lookups. Reached without the warm (a
   /// direct caller, or a warm that threw) it still works; it just does the
-  /// whole load on the calling isolate, which is the ~100ms of blocked UI
-  /// thread this pair exists to move.
+  /// whole load on the calling isolate, which is what this pair exists to
+  /// keep off the UI thread.
   void _ensureBindings() {
     if (_bindings != null) return;
 
@@ -792,9 +991,7 @@ class LiteRtLmFfiClient {
   }) async {
     final initSw = Stopwatch()..start();
     // Load the libraries on a spawned isolate FIRST, so the call below finds
-    // them already mapped. Doing that load inline cost ~100ms of blocked UI
-    // thread on an S25 Ultra, before the engine-create isolate was even
-    // spawned — the first half of the stall in front of a model's first answer.
+    // them already mapped instead of doing the load on the UI thread.
     await _warmNativeLibraries();
     _ensureBindings();
     _backend = backend;
@@ -811,227 +1008,143 @@ class LiteRtLmFfiClient {
         '(text=$backend)',
       );
     }
-    final b = _bindings!;
 
-    // Create engine settings
-    final modelPathPtr = modelPath.toNativeUtf8();
-    final backendPtr = backend.toNativeUtf8();
+    // Windows NPU: point LiteRT at the directory containing
+    // `LiteRtDispatch.dll` and disable HW mask update path. Native Assets
+    // bundles both DLLs next to the executable, so resolvedExecutable.parent
+    // is the right path. Without `dispatch_lib_dir` LiteRT reads
+    // uninitialized env-option memory and engine_create crashes; without
+    // `use_hw_masking_for_npu(false)` LiteRT sets up the kWH HW mask method
+    // which Intel preview NPU (LunarLake/PantherLake) doesn't fully support
+    // → CFG check failure 0xc0000409 (per Matt Kreileder's Intel NPU
+    // pipeline instructions).
+    //
+    // Android NPU: point LiteRT at the app's nativeLibraryDir so it can
+    // dlopen libLiteRtDispatch_Qualcomm.so from there. On Android, Native
+    // Assets unpacks all bundled .so files into nativeLibraryDir at install
+    // time; without this setting LiteRT searches system paths and fails. The
+    // directory comes over a platform channel, so it is asked for here, on the
+    // main isolate, and only the answer goes to the engine's isolate.
+    String? dispatchLibDir;
+    if (Platform.isWindows && backend == 'npu') {
+      dispatchLibDir = File(Platform.resolvedExecutable).parent.path;
+      gemmaLog(
+        '[LiteRtLmFfi] NPU Windows: dispatch_lib_dir=$dispatchLibDir, use_hw_masking_for_npu=false',
+      );
+    } else if (Platform.isAndroid && backend == 'npu') {
+      const bundledChannel = MethodChannel('flutter_gemma_bundled');
+      dispatchLibDir = await bundledChannel.invokeMethod<String>(
+        'getNativeLibraryDir',
+      );
+      if (dispatchLibDir == null) {
+        throw StateError(
+          '[LiteRtLmFfi] NPU Android: getNativeLibraryDir returned null — '
+          'plugin channel not registered; cannot locate '
+          'libLiteRtDispatch_Qualcomm.so.',
+        );
+      }
+      gemmaLog('[LiteRtLmFfi] NPU Android: dispatch_lib_dir=$dispatchLibDir');
+    }
+
+    // #364: on Android, flush the OpenCL command queue every N ops during a
+    // GPU prefill so it doesn't starve the Flutter raster/compositor thread.
+    // By default LiteRT-LM's OpenCL backend dispatches the ENTIRE graph as one
+    // uninterruptible batch (gpu_backend_opencl_litert.cc: "dispatch all
+    // kernels in one batch" when kernel_batch_size<=0), so a ~2s prefill
+    // freezes the compositor (repro'd on Adreno S23 Ultra: raster p95
+    // 6.8ms->123ms). A positive hint_kernel_batch_size inserts a clFlush every
+    // N ops, giving the display work interleave points. Upstream auto-applies
+    // 4 for "generic" models to ensure smooth UI, but recognized Gemma types
+    // aren't generic (engine_settings.cc gates the default on has_generic_model)
+    // so gemma4/3/3n get NO flush unless we set it. Measured on dm3q: kb=4
+    // (upstream value) still janks (p95 63ms), kb=2 is flat (p95 7.3ms ~=
+    // baseline) with no TTFT cost, so 2 — not 4. NOT gpu_context_low_priority:
+    // it only reorders cross-context submission (no Adreno preemption of a
+    // running dispatch) and measured strictly worse (jank + TTFT both up).
+    // Gated to Android: Metal (iOS/macOS) doesn't starve the compositor, and
+    // the setter symbol only ships in the Android native rebuild.
+    final kernelBatchSize = Platform.isAndroid && backend == 'gpu' ? 2 : null;
+    if (kernelBatchSize != null) {
+      gemmaLog(
+        '[LiteRtLmFfi] Android GPU: hint_kernel_batch_size=$kernelBatchSize (#364 smooth UI)',
+      );
+    }
+
     // Vision + audio encoders default to CPU (visionBackend/audioBackend), NOT
     // the text backend. The VISION encoder's STABLEHLO_COMPOSITE ops fail to
     // prepare on the Metal/WebGPU delegates (hard-fails at conversation_create,
     // no fallback — LiteRT-LM#2461), so CPU is mandatory-safe there. AUDIO runs
     // on either backend; CPU is a conservative default (GPU is often faster —
     // Gemma 3n audio ~2x). Both stay overridable via the arg.
-    final visionBackendPtr = enableVision
-        ? visionBackend.toNativeUtf8()
-        : nullptr;
-    final audioBackendPtr = enableAudio ? audioBackend.toNativeUtf8() : nullptr;
+    final request = EngineCreateRequest(
+      modelPath: modelPath,
+      backend: backend,
+      maxTokens: maxTokens,
+      logLevel: gemmaLogLevel,
+      visionBackend: enableVision ? visionBackend : null,
+      audioBackend: enableAudio ? audioBackend : null,
+      cacheDir: cacheDir,
+      maxNumImages: maxNumImages,
+      enableSpeculativeDecoding: enableSpeculativeDecoding,
+      dispatchLibDir: dispatchLibDir,
+      disableHwMaskingForNpu: Platform.isWindows && backend == 'npu',
+      kernelBatchSize: kernelBatchSize,
+    );
 
-    try {
-      final settingsCreateStart = initSw.elapsedMilliseconds;
-      final settings = b.litert_lm_engine_settings_create(
-        modelPathPtr.cast(),
-        backendPtr.cast(),
-        visionBackendPtr == nullptr ? nullptr : visionBackendPtr.cast(),
-        audioBackendPtr == nullptr ? nullptr : audioBackendPtr.cast(),
-      );
-      gemmaLog(
-        '[LiteRtLmFfi/perf] settings_create: ${initSw.elapsedMilliseconds - settingsCreateStart}ms',
-      );
+    // Settings and engine are both made on a spawned isolate: the settings
+    // create alone blocked the UI thread for 81ms on an S25 Ultra, and the
+    // engine create takes seconds.
+    gemmaLog(
+      '[LiteRtLmFfi] Creating engine from $modelPath (backend=$backend, maxTokens=$maxTokens) ...',
+    );
+    gemmaLog(
+      '[LiteRtLmFfi/perf] === START litert_lm_engine_create (native — settings + model load + accelerator init + KV cache prefill) ===',
+    );
+    final sw = Stopwatch()..start();
+    final engineAddr = await createEngineOffMainIsolate(request);
+    _engine = Pointer<LiteRtLmEngine>.fromAddress(engineAddr);
+    sw.stop();
+    gemmaLog(
+      '[LiteRtLmFfi/perf] === END litert_lm_engine_create: ${sw.elapsedMilliseconds}ms (includes isolate spawn ~50-200ms and settings create) ===',
+    );
+    gemmaLog(
+      '[LiteRtLmFfi] litert_lm_engine_create took ${sw.elapsedMilliseconds}ms',
+    );
 
-      if (settings == nullptr) {
-        throw Exception('Failed to create engine settings');
-      }
-
-      // Configure settings
-      b.litert_lm_engine_settings_set_max_num_tokens(settings, maxTokens);
-
-      // Enable benchmarking for session metrics (token counts, timing)
-      b.litert_lm_engine_settings_enable_benchmark(settings);
-
-      if (cacheDir != null) {
-        final cacheDirPtr = cacheDir.toNativeUtf8();
-        // Sets cache dir on main, vision, and audio executors (C API patched)
-        b.litert_lm_engine_settings_set_cache_dir(settings, cacheDirPtr.cast());
-        calloc.free(cacheDirPtr);
-      }
-
-      if (maxNumImages > 0) {
-        b.litert_lm_engine_settings_set_max_num_images(settings, maxNumImages);
-      }
-
-      // MTP / speculative decoding (LiteRT-LM v0.11.0+). Skip when null so
-      // the SDK uses the model's default; only call when caller explicitly
-      // forces on/off.
-      if (enableSpeculativeDecoding != null) {
-        b.litert_lm_engine_settings_set_enable_speculative_decoding(
-          settings,
-          enableSpeculativeDecoding,
-        );
-      }
-
-      // Windows NPU: point LiteRT at the directory containing
-      // `LiteRtDispatch.dll` and disable HW mask update path. Native Assets
-      // bundles both DLLs next to the executable, so resolvedExecutable.parent
-      // is the right path. Without `dispatch_lib_dir` LiteRT reads
-      // uninitialized env-option memory and engine_create crashes; without
-      // `use_hw_masking_for_npu(false)` LiteRT sets up the kWH HW mask method
-      // which Intel preview NPU (LunarLake/PantherLake) doesn't fully support
-      // → CFG check failure 0xc0000409 (per Matt Kreileder's Intel NPU
-      // pipeline instructions).
-      if (Platform.isWindows && backend == 'npu') {
-        final exeDir = File(Platform.resolvedExecutable).parent.path;
-        final dirPtr = exeDir.toNativeUtf8();
-        b.litert_lm_engine_settings_set_litert_dispatch_lib_dir(
-          settings,
-          dirPtr.cast(),
-        );
-        calloc.free(dirPtr);
-        b.litert_lm_engine_settings_set_use_hw_masking_for_npu(settings, false);
-        gemmaLog(
-          '[LiteRtLmFfi] NPU Windows: dispatch_lib_dir=$exeDir, use_hw_masking_for_npu=false',
-        );
-      }
-
-      // Android NPU: point LiteRT at the app's nativeLibraryDir so it can
-      // dlopen libLiteRtDispatch_Qualcomm.so from there. On Android, Native
-      // Assets unpacks all bundled .so files into nativeLibraryDir at install
-      // time; without this setting LiteRT searches system paths and fails.
-      if (Platform.isAndroid && backend == 'npu') {
-        const bundledChannel = MethodChannel('flutter_gemma_bundled');
-        final nativeLibDir = await bundledChannel.invokeMethod<String>(
-          'getNativeLibraryDir',
-        );
-        if (nativeLibDir == null) {
-          throw StateError(
-            '[LiteRtLmFfi] NPU Android: getNativeLibraryDir returned null — '
-            'plugin channel not registered; cannot locate '
-            'libLiteRtDispatch_Qualcomm.so.',
-          );
-        }
-        final dirPtr = nativeLibDir.toNativeUtf8();
-        b.litert_lm_engine_settings_set_litert_dispatch_lib_dir(
-          settings,
-          dirPtr.cast(),
-        );
-        calloc.free(dirPtr);
-        gemmaLog('[LiteRtLmFfi] NPU Android: dispatch_lib_dir=$nativeLibDir');
-      }
-
-      // #364: on Android, flush the OpenCL command queue every N ops during a
-      // GPU prefill so it doesn't starve the Flutter raster/compositor thread.
-      // By default LiteRT-LM's OpenCL backend dispatches the ENTIRE graph as one
-      // uninterruptible batch (gpu_backend_opencl_litert.cc: "dispatch all
-      // kernels in one batch" when kernel_batch_size<=0), so a ~2s prefill
-      // freezes the compositor (repro'd on Adreno S23 Ultra: raster p95
-      // 6.8ms->123ms). A positive hint_kernel_batch_size inserts a clFlush every
-      // N ops, giving the display work interleave points. Upstream auto-applies
-      // 4 for "generic" models to ensure smooth UI, but recognized Gemma types
-      // aren't generic (engine_settings.cc gates the default on has_generic_model)
-      // so gemma4/3/3n get NO flush unless we set it. Measured on dm3q: kb=4
-      // (upstream value) still janks (p95 63ms), kb=2 is flat (p95 7.3ms ~=
-      // baseline) with no TTFT cost, so 2 — not 4. NOT gpu_context_low_priority:
-      // it only reorders cross-context submission (no Adreno preemption of a
-      // running dispatch) and measured strictly worse (jank + TTFT both up).
-      // Gated to Android: Metal (iOS/macOS) doesn't starve the compositor, and
-      // the setter symbol only ships in the Android native rebuild.
-      if (Platform.isAndroid && backend == 'gpu') {
-        b.litert_lm_engine_settings_set_kernel_batch_size(settings, 2);
-        gemmaLog(
-          '[LiteRtLmFfi] Android GPU: hint_kernel_batch_size=2 (#364 smooth UI)',
-        );
-      }
-
-      // Create engine in a background isolate to avoid blocking UI.
-      // Pass settings pointer as int address (Pointer can't cross isolates).
-      gemmaLog(
-        '[LiteRtLmFfi] Creating engine from $modelPath (backend=$backend, maxTokens=$maxTokens) ...',
-      );
-      gemmaLog(
-        '[LiteRtLmFfi/perf] === START litert_lm_engine_create (native — model load + accelerator init + KV cache prefill) ===',
-      );
-      final settingsAddr = settings.address;
-      final sw = Stopwatch()..start();
-      // Snapshot the log level so the spawned isolate (a fresh copy of the
-      // per-isolate top-level `gemmaLogLevel`, default info) honours the
-      // caller's setting instead of leaking perf logs at the default level.
-      final isolateLogLevel = gemmaLogLevel;
-      final engineAddr = await Isolate.run(() {
-        gemmaLogLevel = isolateLogLevel;
-        final isolateSw = Stopwatch()..start();
-        final lib = _openLiteRtLmLibrary();
-        gemmaLog(
-          '[LiteRtLmFfi/perf]   isolate: DynamicLibrary.open: ${isolateSw.elapsedMilliseconds}ms',
-          level: GemmaLogLevel.verbose,
-        );
-        final lookupStart = isolateSw.elapsedMilliseconds;
-        final create = lib
-            .lookupFunction<
-              Pointer Function(Pointer),
-              Pointer Function(Pointer)
-            >('litert_lm_engine_create');
-        gemmaLog(
-          '[LiteRtLmFfi/perf]   isolate: lookupFunction: ${isolateSw.elapsedMilliseconds - lookupStart}ms',
-          level: GemmaLogLevel.verbose,
-        );
-        final createStart = isolateSw.elapsedMilliseconds;
-        final ptr = create(Pointer.fromAddress(settingsAddr)).address;
-        gemmaLog(
-          '[LiteRtLmFfi/perf]   isolate: native litert_lm_engine_create: ${isolateSw.elapsedMilliseconds - createStart}ms',
-          level: GemmaLogLevel.verbose,
-        );
-        return ptr;
-      });
-      _engine = Pointer<LiteRtLmEngine>.fromAddress(engineAddr);
-      sw.stop();
-      gemmaLog(
-        '[LiteRtLmFfi/perf] === END litert_lm_engine_create: ${sw.elapsedMilliseconds}ms (includes isolate spawn ~50-200ms) ===',
-      );
-      gemmaLog(
-        '[LiteRtLmFfi] litert_lm_engine_create took ${sw.elapsedMilliseconds}ms',
-      );
-      b.litert_lm_engine_settings_delete(settings);
-
-      if (_engine == null || _engine == nullptr) {
-        // Read the model's backend constraint BEFORE _dumpNativeLog() truncates
-        // the log. A GPU-only model (e.g. Gemma 4 12B, whose decoder section
-        // declares `section_backend_constraint: gpu`) fails engine_create on the
-        // CPU backend with an otherwise opaque null — turn that into an
-        // actionable error instead of the misleading "model may be invalid".
-        final constraint = _backendConstraintFromNativeLog();
-        _dumpNativeLog();
-        if (constraint != null && constraint != backend) {
-          throw Exception(
-            'This .litertlm model requires the "$constraint" backend — it '
-            'declares section_backend_constraint: $constraint, but the '
-            '"$backend" backend was requested. Use PreferredBackend.$constraint '
-            '(or omit preferredBackend to try GPU first).',
-          );
-        }
-        throw Exception(
-          'Failed to create engine. Model may be invalid: $modelPath',
-        );
-      }
-
-      _isInitialized = true;
-      gemmaLog(
-        '[LiteRtLmFfi/perf] initialize() total: ${initSw.elapsedMilliseconds}ms',
-      );
-      gemmaLog('[LiteRtLmFfi] Engine initialized successfully');
-
-      // Auto-dump the SDK's stderr log after successful engine_create so
-      // users can see what happens inside the native call (model load time,
-      // accelerator init, sampler dlopen attempts, KV cache prefill, etc.).
-      // No-op when stderr redirection isn't wired (release / Android /
-      // Windows). Safe to call before _isInitialized was true since the
-      // dump only reads a file, doesn't touch native state.
+    if (_engine == nullptr) {
+      // Read the model's backend constraint BEFORE _dumpNativeLog() truncates
+      // the log. A GPU-only model (e.g. Gemma 4 12B, whose decoder section
+      // declares `section_backend_constraint: gpu`) fails engine_create on the
+      // CPU backend with an otherwise opaque null — turn that into an
+      // actionable error instead of the misleading "model may be invalid".
+      final constraint = _backendConstraintFromNativeLog();
       _dumpNativeLog();
-    } finally {
-      calloc.free(modelPathPtr);
-      calloc.free(backendPtr);
-      if (visionBackendPtr != nullptr) calloc.free(visionBackendPtr);
-      if (audioBackendPtr != nullptr) calloc.free(audioBackendPtr);
+      if (constraint != null && constraint != backend) {
+        throw Exception(
+          'This .litertlm model requires the "$constraint" backend — it '
+          'declares section_backend_constraint: $constraint, but the '
+          '"$backend" backend was requested. Use PreferredBackend.$constraint '
+          '(or omit preferredBackend to try GPU first).',
+        );
+      }
+      throw Exception(
+        'Failed to create engine. Model may be invalid: $modelPath',
+      );
     }
+
+    _isInitialized = true;
+    gemmaLog(
+      '[LiteRtLmFfi/perf] initialize() total: ${initSw.elapsedMilliseconds}ms',
+    );
+    gemmaLog('[LiteRtLmFfi] Engine initialized successfully');
+
+    // Auto-dump the SDK's stderr log after successful engine_create so
+    // users can see what happens inside the native call (model load time,
+    // accelerator init, sampler dlopen attempts, KV cache prefill, etc.).
+    // No-op when stderr redirection isn't wired (release / Android /
+    // Windows). Safe to call before _isInitialized was true since the
+    // dump only reads a file, doesn't touch native state.
+    _dumpNativeLog();
   }
 
   /// Create a new conversation handle with optional system message and

@@ -1,5 +1,6 @@
 ## Unreleased
 - Native library load and conversation teardown move off the main isolate (UI stall).
+- Engine settings are created on the engine's isolate, not the main one (UI stall).
 
 ## 1.6.4
 - `maxTokens` is no longer clamped up to 1024 on `PreferredBackend.npu`.
