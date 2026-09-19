@@ -67,6 +67,11 @@ void main() {
           'call on the UI thread',
     );
     expect(requests, hasLength(1));
+    expect(
+      requests.single.activationDataType,
+      isNull,
+      reason: 'none asked for, so the engine keeps its own choice',
+    );
     expect(client.isInitialized, isTrue);
   });
 
@@ -87,6 +92,7 @@ void main() {
       maxNumImages: 2,
       audioBackend: 'gpu',
       enableSpeculativeDecoding: false,
+      activationDataType: 0,
     );
 
     final request = requests.single;
@@ -102,6 +108,13 @@ void main() {
     );
     expect(request.maxNumImages, 2);
     expect(request.enableSpeculativeDecoding, isFalse);
+    expect(
+      request.activationDataType,
+      0,
+      reason:
+          'F32, the fix for wrong digits on some GPUs; dropped on the way to '
+          'the isolate, the engine would silently run F16',
+    );
     expect(
       request.logLevel,
       GemmaLogLevel.verbose,
@@ -155,6 +168,7 @@ void main() {
       cacheDir: '/cache',
       maxNumImages: 3,
       enableSpeculativeDecoding: true,
+      activationDataType: 1,
       dispatchLibDir: '/lib/arm64',
       disableHwMaskingForNpu: true,
       kernelBatchSize: 2,
@@ -172,6 +186,7 @@ void main() {
     expect(copy.cacheDir, request.cacheDir);
     expect(copy.maxNumImages, request.maxNumImages);
     expect(copy.enableSpeculativeDecoding, request.enableSpeculativeDecoding);
+    expect(copy.activationDataType, request.activationDataType);
     expect(copy.dispatchLibDir, request.dispatchLibDir);
     expect(copy.disableHwMaskingForNpu, request.disableHwMaskingForNpu);
     expect(copy.kernelBatchSize, request.kernelBatchSize);
